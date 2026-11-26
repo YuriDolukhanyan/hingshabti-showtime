@@ -1,6 +1,9 @@
 """Minimal local presenter: a fullscreen output window plus a control window with a 0-150% volume control.
 
-Usage: python presenter.py "C:\\path\\to\\folder"
+Usage:
+  python presenter.py "C:\\path\\to\\pictures"                  all 4 rounds as numbered pictures (1.png, 2.png, ...)
+  python presenter.py "C:\\path\\to\\pictures" "C:\\path\\to\\round4"   rounds 1-3 as pictures, round 4 from its own
+                                                                    folder (start_*, numbered media, end_*)
 """
 import re
 import sys
@@ -8,22 +11,25 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QKeySequence, QPalette, QPixmap, QShortcut, QWindow
-from PySide6.QtMultimedia import QAudioBufferOutput, QAudioFormat, QAudioSink, QMediaDevices, QMediaPlayer
+from PySide6.QtMultimedia import (QAudioBufferOutput, QAudioFormat, QAudioSink, QMediaDevices, QMediaPlayer,
+                                  QVideoSink)
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy,
                                QSlider, QStackedWidget, QVBoxLayout, QWidget)
 
 EXTENSIONS = {".mp4", ".png", ".jpg", ".jpeg"}
 VIDEO_EXTENSIONS = {".mp4"}
-BLACK = None  # item that shows an empty black screen (right before and right after the numbered media)
-INTRO_PREFIX = "start_"  # start_1.png, start_2.png, ... come first and are not numbered
-OUTRO_PREFIX = "end_"  # end_1.png, end_2.png, ... come last and are not numbered
+BLACK = None  # item that shows an empty black screen
+INTRO_PREFIX = "start_"  # round 4: start_1.png, start_2.png, ... come first and are not numbered
+OUTRO_PREFIX = "end_"  # round 4: end_1.png, end_2.png, ... come last and are not numbered
 MAX_VOLUME = 200  # percent
 VOLUME_STEP = 5  # percent per Up / Down key press
 NUMBER_MARGIN = 20  # px between the media number and the output's upper-left corner
 RESTART_AFTER_MS = 2000  # Left on a video played longer than this restarts it instead of going back
+PREVIEW_SIZE = QSize(320, 180)  # next-slide preview in the control window
+THUMBNAIL_AT_MS = 1000  # video previews show the frame at this time
 
 
 def natural_key(path):
@@ -32,13 +38,32 @@ def natural_key(path):
 
 
 def load_files(folder):
-    """Returns (intro, media, outro): the start_* slides, the numbered media and the end_* slides, each sorted."""
-    files = sorted((p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() in EXTENSIONS),
-                   key=natural_key)
-    intro = [p for p in files if p.name.lower().startswith(INTRO_PREFIX)]
-    outro = [p for p in files if p.name.lower().startswith(OUTRO_PREFIX)]
-    media = [p for p in files if p not in intro and p not in outro]
-    return intro, media, outro
+    """All .mp4 / .png / .jpg / .jpeg files of the folder, sorted 1, 2, ... 10, 11."""
+    return sorted((p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() in EXTENSIONS),
+                  key=natural_key)
+
+
+def build_show(pictures_folder, round4_folder=None):
+    """The whole show as a list of (item, label for the control window, on-screen number or None).
+
+    One folder:  BLACK, 1..N, BLACK
+    Two folders: BLACK, 1..N, start_*, BLACK, round-4 media (numbered 1, 2, ...), BLACK, end_*, BLACK
+    """
+    pictures = load_files(pictures_folder)
+    show = [(BLACK, "Black screen - start", None)]
+    show += [(p, f"Slide {i} / {len(pictures)} - {p.name}", None) for i, p in enumerate(pictures, 1)]
+    if round4_folder:
+        files = load_files(round4_folder)
+        intro = [p for p in files if p.name.lower().startswith(INTRO_PREFIX)]
+        outro = [p for p in files if p.name.lower().startswith(OUTRO_PREFIX)]
+        media = [p for p in files if p not in intro and p not in outro]
+        show += [(p, f"Round 4 intro {i} / {len(intro)} - {p.name}", None) for i, p in enumerate(intro, 1)]
+        show.append((BLACK, "Black screen - before round 4", None))
+        show += [(p, f"Round 4: {i} / {len(media)} - {p.name}", i) for i, p in enumerate(media, 1)]
+        show.append((BLACK, "Black screen - after round 4", None))
+        show += [(p, f"Round 4 outro {i} / {len(outro)} - {p.name}", None) for i, p in enumerate(outro, 1)]
+    show.append((BLACK, "Black screen - end", None))
+    return show
 
 
 def is_video(item):
@@ -125,7 +150,12 @@ class NumberOverlay(QLabel):
                          | Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setStyleSheet("color: white; font-family: Arial; font-size: 115pt; font-weight: bold;")
+        self.set_inverted(False)
+
+    def set_inverted(self, inverted):
+        """Invert toggle: white number by default, black when inverted."""
+        color = "black" if inverted else "white"
+        self.setStyleSheet(f"color: {color}; font-family: Arial; font-size: 115pt; font-weight: bold;")
 
     def show_number(self, number):
         self.setText(str(number))
@@ -191,6 +221,62 @@ class Timeline(QProgressBar):
         self.seek_requested.emit(round(fraction * self.maximum()))
 
 
+class Preview(QLabel):
+    """Small black box in the control window that shows the next slide."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(PREVIEW_SIZE)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet("background: black; color: gray; font-size: 12pt;")
+
+    def show_pixmap(self, pixmap):
+        dpr = self.devicePixelRatioF()  # scale in device pixels so the preview stays sharp on HiDPI screens
+        scaled = pixmap.scaled(self.size() * dpr, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled.setDevicePixelRatio(dpr)
+        self.setPixmap(scaled)
+
+
+class VideoThumbnails(QObject):
+    """Grabs one still frame of every video with a hidden, silent player, one video after the other."""
+
+    ready = Signal()  # a new thumbnail is in self.pixmaps
+
+    def __init__(self, videos):
+        super().__init__()
+        self.pixmaps = {}  # video path -> QPixmap
+        self.queue = list(videos)
+        self.current = None
+        self.sink = QVideoSink(self)
+        self.player = QMediaPlayer(self)  # no audio output: completely silent
+        self.player.setVideoSink(self.sink)
+        self.player.mediaStatusChanged.connect(self.on_status)
+        self.sink.videoFrameChanged.connect(self.on_frame)
+
+    def next_video(self):
+        if not self.queue:
+            self.player.setSource(QUrl())  # all done: free the decoder
+            return
+        self.current = self.queue.pop(0)
+        self.player.setSource(QUrl.fromLocalFile(str(self.current)))
+
+    def on_status(self, status):
+        if status == QMediaPlayer.LoadedMedia:
+            self.player.setPosition(min(THUMBNAIL_AT_MS, self.player.duration() // 2))
+            self.player.pause()  # decodes the frame at that position without playing
+        elif status == QMediaPlayer.InvalidMedia:
+            self.next_video()
+
+    def on_frame(self, frame):
+        image = frame.toImage() if frame.isValid() else QImage()
+        if self.current is None or self.current in self.pixmaps or image.isNull():
+            return
+        self.pixmaps[self.current] = QPixmap.fromImage(image.scaled(PREVIEW_SIZE * 3, Qt.KeepAspectRatio,
+                                                                    Qt.SmoothTransformation))
+        self.ready.emit()
+        QTimer.singleShot(0, self.next_video)  # change the source outside of the frame callback
+
+
 class ControlWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -228,10 +314,26 @@ class ControlWindow(QWidget):
         self.seek_button.setCheckable(True)  # off by default, so a stray click can't jump in the video
         self.seek_button.setStyleSheet("font-size: 12pt; padding: 6px;")
         self.seek_button.toggled.connect(self.timeline.set_clickable)
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.number_button)
-        button_row.addWidget(self.seek_button)
-        button_row.addStretch(1)
+        self.keys_button = QPushButton("Keyboard control")
+        self.keys_button.setCheckable(True)
+        self.keys_button.setChecked(True)  # on by default: arrows and Space control the show
+        self.keys_button.setStyleSheet("font-size: 12pt; padding: 6px;")
+        self.on_top_button = QPushButton("Always on top")
+        self.on_top_button.setCheckable(True)
+        self.on_top_button.setChecked(True)  # on by default
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)  # the window isn't shown yet, so no show() needed here
+        self.on_top_button.setStyleSheet("font-size: 12pt; padding: 6px;")
+        self.on_top_button.toggled.connect(self.set_always_on_top)
+        self.invert_button = QPushButton("Invert")
+        self.invert_button.setCheckable(True)  # off = white number, on = black number
+        self.invert_button.setStyleSheet("font-size: 12pt; padding: 6px;")
+        button_row = QGridLayout()
+        button_row.addWidget(self.keys_button, 0, 0)
+        button_row.addWidget(self.number_button, 0, 1)
+        button_row.addWidget(self.seek_button, 0, 2)
+        button_row.addWidget(self.on_top_button, 0, 3)
+        button_row.addWidget(self.invert_button, 1, 1)  # under "Show number on screen"
+        button_row.setColumnStretch(4, 1)
 
         hint = QLabel("Right = next    Left = previous (restarts a video after 2 s)    Up / Down = volume    "
                       "Esc = quit    "
@@ -239,17 +341,31 @@ class ControlWindow(QWidget):
                       "Click on timeline = jump (if clickable)")
         hint.setStyleSheet("color: gray;")
 
+        self.preview = Preview()
+        info = QVBoxLayout()
+        info.addWidget(self.current_label)
+        info.addWidget(self.next_label)
+        info.addLayout(button_row)
+        info.addStretch(1)
+        top_row = QHBoxLayout()
+        top_row.addLayout(info, 1)
+        top_row.addWidget(self.preview, 0, Qt.AlignTop)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self.current_label)
-        layout.addWidget(self.next_label)
-        layout.addLayout(button_row)
+        layout.addLayout(top_row)
         layout.addStretch(1)
         layout.addLayout(time_row)
         layout.addLayout(volume_row)
         layout.addWidget(hint)
         for widget in (self, self.current_label, self.next_label, self.time_label, self.timeline, self.volume_label,
-                       self.volume_slider, self.number_button, self.seek_button, hint):
+                       self.volume_slider, self.number_button, self.seek_button, self.keys_button,
+                       self.on_top_button, self.invert_button, hint):
             widget.setFocusPolicy(Qt.NoFocus)  # mouse still works, but these never eat arrow keys
+
+    def set_always_on_top(self, on_top):
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, on_top)
+        self.show()  # changing a window flag hides the window, so show it again
+        self.activateWindow()
 
     def closeEvent(self, event):
         QApplication.quit()  # closing the control window ends the whole show
@@ -272,11 +388,11 @@ class ImageLoader(QObject):
 class Presenter(QObject):
     """Owns the item list and current index and updates both windows directly."""
 
-    def __init__(self, intro, media, outro, app):
+    def __init__(self, show, app):
         super().__init__()
-        self.intro, self.media, self.outro = intro, media, outro
-        self.items = [*intro, BLACK, *media, BLACK, *outro]
-        self.first_media = len(intro) + 1  # index of media number 1
+        self.items = [item for item, _label, _number in show]
+        self.labels = [label for _item, label, _number in show]
+        self.numbers = [number for _item, _label, number in show]  # on-screen number, None = no number
         self.index = 0
         self.cache = {}  # index -> QPixmap, only for the current item and its neighbours
         self.pending = set()
@@ -297,9 +413,12 @@ class Presenter(QObject):
         slider.setValue(100)
         self.set_volume(slider.value())
         self.control.number_button.toggled.connect(self.update_number)
+        self.control.invert_button.toggled.connect(self.output.number.set_inverted)
 
         self.loader = ImageLoader()
         self.loader.loaded.connect(self.on_image_loaded)
+        self.thumbnails = VideoThumbnails(dict.fromkeys(item for item in self.items if is_video(item)))
+        self.thumbnails.ready.connect(self.update_preview)
 
         keys = (
             (Qt.Key_Right, self.next),
@@ -309,12 +428,15 @@ class Presenter(QObject):
             (Qt.Key_Space, self.toggle_pause),
             (Qt.Key_Escape, app.quit),
         )
+        self.shortcuts = {}
         for key, slot in keys:
             shortcut = QShortcut(QKeySequence(key), self.control)
             shortcut.setContext(Qt.ApplicationShortcut)  # works whichever window is focused
             shortcut.activated.connect(slot)
+            self.shortcuts[key] = shortcut
+        self.control.keys_button.toggled.connect(self.set_keys_enabled)
 
-        app.installEventFilter(self)  # to catch clicks on the output window
+        app.installEventFilter(self)  # to catch clicks on the output window and mouse-wheel scrolls
         app.aboutToQuit.connect(self.player.stop)
 
     def start(self):
@@ -328,6 +450,7 @@ class Presenter(QObject):
         self.control.raise_()
         self.control.activateWindow()
         self.show_item(0)
+        self.thumbnails.next_video()  # start grabbing video previews (~0.4 s per video, in the background)
 
     def set_volume(self, percent):
         self.audio.gain = percent / 100
@@ -342,6 +465,12 @@ class Presenter(QObject):
             self.seek(0)  # restart the video
         elif self.index > 0:
             self.show_item(self.index - 1)
+
+    def set_keys_enabled(self, enabled):
+        """Keyboard control toggle: when off, arrows and Space do nothing (Esc still quits)."""
+        for key, shortcut in self.shortcuts.items():
+            if key != Qt.Key_Escape:
+                shortcut.setEnabled(enabled)
 
     def toggle_pause(self):
         if not is_video(self.items[self.index]):
@@ -377,6 +506,7 @@ class Presenter(QObject):
         self.update_number()
         self.update_timeline()
         self.preload()
+        self.update_preview()
 
     def pixmap(self, index):
         if not is_image(self.items[index]):
@@ -397,6 +527,24 @@ class Presenter(QObject):
         self.pending.discard(index)
         if abs(index - self.index) <= 1 and index not in self.cache and not image.isNull():
             self.cache[index] = QPixmap.fromImage(image)
+            if index == self.index + 1:
+                self.update_preview()
+
+    def update_preview(self):
+        """Next slide in the control window's upper-right corner: picture, video still, black box or '(end)'."""
+        preview, index = self.control.preview, self.index + 1
+        item = self.items[index] if index < len(self.items) else BLACK
+        preview.clear()  # an empty black box, also what a black screen shows
+        if index >= len(self.items):
+            preview.setText("(end)")
+        elif item is BLACK:
+            pass
+        elif is_video(item) and item in self.thumbnails.pixmaps:
+            preview.show_pixmap(self.thumbnails.pixmaps[item])
+        elif is_image(item) and index in self.cache:
+            preview.show_pixmap(self.cache[index])
+        else:
+            preview.setText(item.name)  # still loading in the background
 
     def describe(self, index):
         if index >= len(self.items):
@@ -405,28 +553,13 @@ class Presenter(QObject):
             return "black screen"
         return self.items[index].name
 
-    def media_number(self, index):
-        """1, 2, ... for the media between the two black screens; None for intro, outro and black screens."""
-        number = index - self.first_media + 1
-        return number if 1 <= number <= len(self.media) else None
-
     def update_info(self):
-        item, number = self.items[self.index], self.media_number(self.index)
-        outro_start = self.first_media + len(self.media) + 1  # index of end_1
-        if number is not None:
-            current = f"{number} / {len(self.media)} - {item.name}"
-        elif item is BLACK:
-            current = "Black screen - before media" if self.index < self.first_media else "Black screen - after media"
-        elif self.index < self.first_media:
-            current = f"Intro {self.index + 1} / {len(self.intro)} - {item.name}"
-        else:
-            current = f"Outro {self.index - outro_start + 1} / {len(self.outro)} - {item.name}"
-        self.control.current_label.setText(current)
+        self.control.current_label.setText(self.labels[self.index])
         self.control.next_label.setText(f"Next: {self.describe(self.index + 1)}")
 
     def update_number(self):
-        """Media number (1, 2, ...) in the output's upper-left corner, if the toggle is on; only for numbered media."""
-        number = self.media_number(self.index)
+        """Round-4 media number (1, 2, ...) in the output's upper-left corner, if the toggle is on."""
+        number = self.numbers[self.index]
         if self.control.number_button.isChecked() and number is not None:
             self.output.number.show_number(number)
         else:
@@ -454,6 +587,8 @@ class Presenter(QObject):
         return False
 
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            return True  # mouse-wheel scrolling never changes anything (e.g. the volume slider)
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick) and self.is_output(obj):
             self.toggle_pause()
             return True  # clicks on the output do nothing else
@@ -462,18 +597,26 @@ class Presenter(QObject):
 
 def main():
     app = QApplication(sys.argv)
-    folder = sys.argv[1] if len(sys.argv) > 1 else QFileDialog.getExistingDirectory(None, "Choose presentation folder")
-    if not folder:
-        return 0
-    if not Path(folder).is_dir():
-        print(f"Not a folder: {folder}")
-        return 1
-    intro, media, outro = load_files(folder)
-    if not (intro or media or outro):
-        print(f"No .mp4 / .png / .jpg / .jpeg files in {folder}")
+    args = sys.argv[1:3]
+    if args:
+        pictures_folder = args[0]
+        round4_folder = args[1] if len(args) > 1 else None
+    else:
+        pictures_folder = QFileDialog.getExistingDirectory(None, "Choose the pictures folder (rounds 1-3, or all 4)")
+        if not pictures_folder:
+            return 0
+        round4_folder = QFileDialog.getExistingDirectory(None, "Choose the 4th round folder (Cancel = pictures only)")
+    for folder in (pictures_folder, round4_folder):
+        if folder and not Path(folder).is_dir():
+            print(f"Not a folder: {folder}")
+            return 1
+
+    show = build_show(pictures_folder, round4_folder or None)
+    if all(item is BLACK for item, _label, _number in show):
+        print("No .mp4 / .png / .jpg / .jpeg files found")
         return 1
 
-    presenter = Presenter(intro, media, outro, app)
+    presenter = Presenter(show, app)
     presenter.start()
     return app.exec()
 
